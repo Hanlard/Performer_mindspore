@@ -14,8 +14,8 @@ from mindspore import context
 from functools import partial
 
 context.set_context(save_graphs=False,
-                    mode=context.GRAPH_MODE,
-                    # mode=context.PYNATIVE_MODE,
+                    # mode=context.GRAPH_MODE,
+                    mode=context.PYNATIVE_MODE,
                     device_target="Ascend",
                     device_id=7)
 
@@ -316,7 +316,8 @@ class SelfAttention(nn.Cell):
         self.view = P.Reshape()
         self.Concat = P.Concat(axis=1)
         self.Mul = P.Mul()
-
+        self.ExpandDims = P.ExpandDims()
+        self.Tile = P.Tile()
     def construct(self, x, mask):
         """
         #b:batch_size
@@ -324,18 +325,20 @@ class SelfAttention(nn.Cell):
         #n:seq_len
         #d:dim_perhead
         """
-        b, n, _, = x.shape
+        b, n, dim, = x.shape
         h = self.heads
 
         q, k, v = self.to_q(x), self.to_k(x), self.to_v(x)
         q, k, v = self.view(q, (b,h,n,self.dim_head)), self.view(k, (b,h,n,self.dim_head)), self.view(v, (b,h,n,self.dim_head))
 
+        mask = self.Tile(self.ExpandDims(mask, -1), (1,1,dim))
+
         v = self.Mul(v,self.view(mask,v.shape))
 
         out = self.fast_attention(q, k, v)
-        # print(f"out.shape2={out.shape}")
         out = self.view(out, (b,n,h* self.dim_head))
         out =  self.to_out(out)
+
         return self.dropout(out)
 
 class EmbeddingLookup(nn.Cell):
@@ -406,6 +409,7 @@ class Performer_layer(nn.Cell):
         """
         attention_mask : float32 1表示保留 0表示丢弃
         """
+
         x = self.LayerNorm(x)
         out = x + self.SelfAttention(x, attention_mask)
         out = self.LayerNorm(out)
@@ -413,10 +417,12 @@ class Performer_layer(nn.Cell):
         return out
 
 class Performer(nn.Cell):
-    def __init__(self,dim, num_layers, heads, dim_head, causal=False, nb_features=None, qr_uniform_q = False, dropout = 0.9):
+    def __init__(self,dim, depth, heads, causal=False, nb_features=None, qr_uniform_q = False, dropout = 0.9):
         super(Performer, self).__init__()
+        assert dim % heads == 0
+        dim_head = dim//heads
         layers = []
-        for _ in range(num_layers):
+        for _ in range(depth):
             layers.append(Performer_layer(dim=dim, heads=heads,
                                           dim_head=dim_head,
                                           causal=causal,
@@ -432,6 +438,34 @@ class Performer(nn.Cell):
             prev_output = layer_module(prev_output, attention_mask)
         return prev_output
 
+
+class PerformerLM(nn.Cell):
+    def __init__(self, num_tokens, max_seq_len, dim, depth, heads, causal = True,
+                 nb_features = None, emb_dropout = 0.9, pf_dropout = 0.9, qr_uniform_q = False):
+        super(PerformerLM,self).__init__()
+        self.max_seq_len = max_seq_len
+        self.dim = dim
+        self.num_tokens = num_tokens
+        self.token_emb = EmbeddingLookup(num_tokens, dim)
+        self.pos_emb = AbsolutePositionalEmbedding(dim, max_seq_len)
+        self.dropout = nn.Dropout(emb_dropout)
+        self.performer = Performer(dim, depth, heads, causal, nb_features, qr_uniform_q, pf_dropout )
+        self.norm = LayerNorm(dim)
+        self.MatMul = P.MatMul(transpose_b=True)
+        self.Reshape = P.Reshape()
+    def construct(self, input_ids, attention_mask):
+        # b, n = input_ids.shape
+        # assert n <= self.max_seq_len, f'sequence length {n} must be less than the max sequence length {self.max_seq_len}'
+        # token and positional embeddings
+        x = self.token_emb(input_ids)
+        x += self.pos_emb(x)
+        x = self.dropout(x)
+        x = self.performer(x,attention_mask)
+        # norm and to logits
+        #[batch,seq,hidden]
+        x = self.norm(x)
+        res = self.MatMul(self.Reshape(x,(-1,self.dim)), self.token_emb.embedding_table)
+        return self.Reshape(res, input_ids.shape+(self.num_tokens,))
 
 if __name__ == '__main__':
     # B, Sq, H = 4, 2, 3
@@ -528,12 +562,34 @@ if __name__ == '__main__':
     # print(model)
 
     ## test for performer
-    Batch,Heads,Seq,Dim_head = 2, 3, 4, 5
+    # Batch,Heads,Seq,Dim_head = 2, 3, 4, 5
+    # np.random.seed(777)
+    # x = Tensor.from_numpy(np.random.random([Batch,Seq,Heads*Dim_head]).astype(np.float32))
+    # mask = Tensor.from_numpy(np.ones(x.shape).astype(np.float32))
+    # model = Performer(depth =2, dim=Heads*Dim_head, heads=Heads, causal=True)
+    # out = model(x,mask)
+    # print(out)
+    # print(out.shape)
+    # print(model)
+
+    # test for PerformerLM
+
     np.random.seed(777)
-    x = Tensor.from_numpy(np.random.random([Batch,Seq,Heads*Dim_head]).astype(np.float32))
-    mask = Tensor.from_numpy(np.ones(x.shape).astype(np.float32))
-    model = Performer(num_layers =2, dim=Heads*Dim_head, heads=Heads, dim_head=Dim_head, causal=True)
-    out = model(x,mask)
+    Batch, Seq, Dim, Heads = 2,10,8,2
+    #[2,10]
+    input_ids = Tensor.from_numpy(np.random.random([Batch,Seq,]).astype(np.int))
+    mask_np = np.ones(input_ids.shape).astype(np.float32)
+    mask_np[0, 2:] = 0.
+    #[2,10,8]
+    x = Tensor.from_numpy(np.random.random([Batch, Seq, Dim]).astype(np.float32))
+    mask = Tensor.from_numpy(mask_np)
+    # model = Performer(depth =2, dim=Dim, heads=Heads, causal=True)
+    # print(model)
+    # out = model(x,mask)
+    # model = SelfAttention(dim=Dim, heads=Heads, dim_head=Dim//Heads, causal = False, nb_features = None, qr_uniform_q = False, dropout = 0.9)
+    # out = model(x,mask)
+    model = PerformerLM(num_tokens=100, max_seq_len=Seq, dim=Dim, depth=3, heads=Heads, causal = True)
+    print(model)
+    out = model(input_ids, mask)
     print(out)
     print(out.shape)
-    print(model)
